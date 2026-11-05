@@ -31,6 +31,30 @@ public class NativeAudioPolicyTest {
             assertFalse(NativeAudio.voiceAsMedia(new int[]{speaker,headset},7));
         assertFalse(NativeAudio.voiceAsMedia(new int[]{speaker},0));
     }
+    @Test public void voiceStreamMatchesTheOutputRoute(){
+        assertEquals(android.media.AudioManager.STREAM_MUSIC,NativeAudio.voiceStream(true));
+        assertEquals(android.media.AudioManager.STREAM_VOICE_CALL,NativeAudio.voiceStream(false));
+    }
+    @Test public void streamVolumeFractionIsZeroWithoutARangeAndClamped(){
+        assertEquals(0f,NativeAudio.streamVolumeFraction(3,5,5),0f);
+        assertEquals(0f,NativeAudio.streamVolumeFraction(1,2,1),0f);
+        assertEquals(0f,NativeAudio.streamVolumeFraction(0,0,10),0f);
+        assertEquals(.5f,NativeAudio.streamVolumeFraction(5,0,10),0f);
+        assertEquals(1f,NativeAudio.streamVolumeFraction(10,0,10),0f);
+        assertEquals(0f,NativeAudio.streamVolumeFraction(-1,0,10),0f);
+        assertEquals(1f,NativeAudio.streamVolumeFraction(12,0,10),0f);
+    }
+    @Test public void echoDiagnosticsIncludeStreamGateModeAndCounts(){
+        assertEquals("echo_stream=media,echo_gate=on,aec_available=true,aec_created=false,aec_enabled=true,gated=3,passed=4",
+                NativeAudio.echoDiagnostics(true,true,true,false,true,3,4));
+        assertTrue(NativeAudio.echoDiagnostics(false,false,false,false,false,0,0).contains("echo_stream=call,echo_gate=off"));
+        assertEquals("gate=on,aec101,g3,p4",NativeAudio.echoReportSummary(true,true,true,false,true,3,4));
+    }
+    @Test public void echoGatePreferenceIsDebugOnlyAndOffModeCountsWithoutSilencing(){
+        assertTrue(NativeAudio.gateEnabled(false,false));assertTrue(NativeAudio.gateEnabled(true,true));assertFalse(NativeAudio.gateEnabled(true,false));
+        assertFalse(NativeAudio.shouldSilence(false,true));
+        assertTrue(NativeAudio.shouldSilence(true,true));assertFalse(NativeAudio.shouldSilence(false,false));
+    }
     @Test public void pcmMeterHandlesSignedLittleEndianSilenceAndClipping() {
         assertEquals(0,NativeAudio.level(new byte[20]),0);
         assertEquals(0,NativeAudio.level(new byte[0]),0);

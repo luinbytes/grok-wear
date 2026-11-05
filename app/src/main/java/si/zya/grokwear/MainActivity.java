@@ -104,6 +104,7 @@ public final class MainActivity extends Activity {
     };
     private final Runnable pollTick=()->pollLogin();
     @Override public void onCreate(Bundle state){super.onCreate(state);ProblemReport.watchCrashes(this);
+        saveEchoGatePreference(getIntent());
         preview=BuildConfig.DEBUG&&getIntent().getBooleanExtra("ui_preview",false);
         // Launch-media captures: no preview label, a short demo chat per Bot. Synthetic data only.
         previewMedia=preview&&getIntent().getBooleanExtra("preview_media",false);
@@ -131,10 +132,14 @@ public final class MainActivity extends Activity {
         scrollToEnd=true;render();
     }
     @Override protected void onNewIntent(Intent intent){super.onNewIntent(intent);setIntent(intent);
+        saveEchoGatePreference(intent);
         // An existing real-account activity cannot be switched into screenshot mode.
         if(preview&&!openBotExtra(intent).isEmpty())openPreviewReply(intent.getStringExtra("preview_bot"));
         else if(preview){previewMedia=intent.getBooleanExtra("preview_media",false);setPreviewScreen(intent.getStringExtra("preview_screen"));}
         else{pendingOpenBot=openBotExtra(intent);noteAssist(intent);} // onResume's account load opens it.
+    }
+    private void saveEchoGatePreference(Intent intent){
+        if(BuildConfig.DEBUG&&intent!=null&&intent.hasExtra("echo_gate"))getSharedPreferences("grokwear_ui",MODE_PRIVATE).edit().putBoolean("echo_gate",intent.getBooleanExtra("echo_gate",true)).apply();
     }
     /** The assistant button, through GrokAssistantSessionService: a call with the main Bot after the account loads. */
     private void noteAssist(Intent intent){

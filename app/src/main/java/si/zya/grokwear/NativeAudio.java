@@ -5,13 +5,17 @@ import android.Manifest;
 import android.content.pm.PackageManager;
 import android.media.*;
 import android.media.audiofx.AcousticEchoCanceler;
+import android.os.SystemClock;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** In-memory duplex PCM; microphone starts only after the remote session is ready. */
 final class NativeAudio implements AutoCloseable {
     interface Listener { void input(byte[] pcm,float level); void output(float level); void drained(); void failure(String safe); }
     private static final int RATE=24000,FRAME=2048;
+    /** The voice output stream is read at most this often, never once per audio frame. */
+    private static final long STREAM_VOLUME_MS=250;
     private final Context context; private final AudioManager manager; private final Listener listener;
     private final PcmPlaybackBuffer queue=new PcmPlaybackBuffer();
     private final AtomicBoolean closed=new AtomicBoolean();
@@ -19,6 +23,13 @@ final class NativeAudio implements AutoCloseable {
     private AudioRecord record; private volatile AudioTrack track; private AcousticEchoCanceler echo;
     private AudioFocusRequest focus; private Thread capture,playback;
     private final CaptureGate captureGate=new CaptureGate();
+    /** Speaker thread publishes; microphone thread reads. The gate itself is synchronized. */
+    private final EchoGate echoGate=new EchoGate();
+    private final AtomicLong gatedFrames=new AtomicLong(),passedFrames=new AtomicLong();
+    private volatile boolean aecAvailable,aecCreated,aecEnabled;
+    /** Play thread only. */
+    private float cachedStreamVolume=1f;private long streamVolumeAt=-1;
+    private final boolean echoGateEnabled;
     /** A read belongs to one unmuted interval; never accept a result spanning stop/start. */
     static final class CaptureGate {
         private boolean muted=true;private long generation;
@@ -55,6 +66,8 @@ final class NativeAudio implements AutoCloseable {
         for(int type:outputs)for(int headset:HEADSETS)if(type==headset)return false;
         return true;
     }
+    static int voiceStream(boolean media){return media?AudioManager.STREAM_MUSIC:AudioManager.STREAM_VOICE_CALL;}
+    static boolean gateEnabled(boolean debug,boolean preference){return !debug||preference;}
     private volatile boolean media;
     /** Whether this call's voice plays as media; for the problem log. */
     boolean voiceAsMedia(){return media;}
@@ -64,7 +77,8 @@ final class NativeAudio implements AutoCloseable {
         catch(RuntimeException unknown){return new int[0];}
     }
     private volatile long framesWritten,framesQueued; private boolean hadOutput;
-    NativeAudio(Context context,Listener listener){this.context=context.getApplicationContext();this.manager=(AudioManager)context.getSystemService(Context.AUDIO_SERVICE);this.listener=listener;}
+    NativeAudio(Context context,Listener listener){this.context=context.getApplicationContext();this.manager=(AudioManager)context.getSystemService(Context.AUDIO_SERVICE);this.listener=listener;
+        echoGateEnabled=gateEnabled(BuildConfig.DEBUG,this.context.getSharedPreferences("grokwear_ui",Context.MODE_PRIVATE).getBoolean("echo_gate",true));}
     void start(boolean initiallyMuted) {
         synchronized(this){userMuted=initiallyMuted;}captureGate.mute(initiallyMuted);
         try {
@@ -103,7 +117,8 @@ final class NativeAudio implements AutoCloseable {
                 .setAudioFormat(new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(RATE).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
                 .setBufferSizeInBytes(in).build();
             if(record.getState()!=AudioRecord.STATE_INITIALIZED)throw new IllegalStateException();
-            if(AcousticEchoCanceler.isAvailable()){echo=AcousticEchoCanceler.create(record.getAudioSessionId());if(echo!=null)echo.setEnabled(true);}
+            aecAvailable=AcousticEchoCanceler.isAvailable();
+            if(aecAvailable){echo=AcousticEchoCanceler.create(record.getAudioSessionId());aecCreated=echo!=null;if(echo!=null){echo.setEnabled(true);aecEnabled=echo.getEnabled();}}
             track.play();
             if(!captureGate.muted()){
                 record.startRecording();
@@ -121,7 +136,12 @@ final class NativeAudio implements AutoCloseable {
         // Like the official Android client, a failed read is retried; only about 2 s of failures end the call.
         if(n<=0){if(++failedReads>=40){listener.failure("Microphone capture stopped. Start a new call.");return;}Thread.sleep(50);continue;}
         failedReads=0;
-        byte[] pcm=Arrays.copyOf(buffer,n);try{listener.input(pcm,level(pcm));}finally{Arrays.fill(pcm,(byte)0);}
+        byte[] pcm=Arrays.copyOf(buffer,n);float heard=level(pcm);
+        // A gated frame is still sent, as silence, so the socket stays continuous and the orb stays still.
+        boolean wouldGate=!echoGate.pass(heard,SystemClock.elapsedRealtime());
+        if(wouldGate){gatedFrames.incrementAndGet();if(shouldSilence(echoGateEnabled,wouldGate)){Arrays.fill(pcm,(byte)0);heard=0f;}}
+        else passedFrames.incrementAndGet();
+        try{listener.input(pcm,heard);}finally{Arrays.fill(pcm,(byte)0);}
     }}catch(InterruptedException ignored){Thread.currentThread().interrupt();}catch(Exception ignored){if(!closed.get())listener.failure("Microphone capture failed.");}finally{Arrays.fill(buffer,(byte)0);}}
     // The microphone records only when the caller hasn't muted and no other app holds audio focus.
     private boolean userMuted=true,focusPaused;
@@ -149,6 +169,7 @@ final class NativeAudio implements AutoCloseable {
             return n;
         };
         try{while(!closed.get()){
+            long now=SystemClock.elapsedRealtime();float vol=streamVolume(now);
             int n=0;boolean drained=false;
             synchronized(lock){
                 if(closed.get()||track==null)return;
@@ -156,6 +177,10 @@ final class NativeAudio implements AutoCloseable {
                 // speech remains outside the ring to be written after a caller interrupts it.
                 if(queue.size()>0){n=queue.writeTo(writer,scratch);if(n>0)framesWritten+=n/2;}
                 else if(hadOutput&&Integer.toUnsignedLong(track.getPlaybackHeadPosition())>=framesWritten){hadOutput=false;drained=true;}
+                // Feed the gate before dropping the lock, so interrupt()'s reset cannot lose to this frame.
+                if(n>0)echoGate.output(writtenLevel[0],vol,now);
+                else if(drained)echoGate.drained(vol,now);
+                else if(n==0)echoGate.volume(vol);
                 // Successful writes continue immediately. A full native buffer drains ~1 frame
                 // per 42 us, so 20 ms waits keep it topped up; an idle player is woken by
                 // output(), interrupt() or close().
@@ -174,15 +199,42 @@ final class NativeAudio implements AutoCloseable {
     /** Frames actually played since the last interrupt. Lock-free for UI captions. */
     long playedFrames(){AudioTrack t=track;if(t==null)return 0;try{return Math.min(framesWritten,Integer.toUnsignedLong(t.getPlaybackHeadPosition()));}catch(RuntimeException released){return 0;}}
     void interrupt(){synchronized(this){
-        synchronized(lock){queue.clear();framesWritten=0;framesQueued=0;hadOutput=false;
+        synchronized(lock){echoGate.reset();queue.clear();framesWritten=0;framesQueued=0;hadOutput=false;
         // Flushing restarts the track, except while another app holds audio focus: focus coming back plays it.
         if(track!=null)try{track.pause();track.flush();if(!focusPaused)track.play();}catch(Exception ignored){}lock.notifyAll();}}listener.output(0);}
+    /** Counts and booleans only. {@code enabled} is getEnabled() after setEnabled(true). */
+    String echoDiagnostics(){return echoDiagnostics(media,echoGateEnabled,aecAvailable,aecCreated,aecEnabled,gatedFrames.get(),passedFrames.get());}
+    String echoReportSummary(){return echoReportSummary(media,echoGateEnabled,aecAvailable,aecCreated,aecEnabled,gatedFrames.get(),passedFrames.get());}
+    static String echoDiagnostics(boolean media,boolean gateEnabled,boolean available,boolean created,boolean enabled,long gated,long passed){
+        return "echo_stream="+(media?"media":"call")+",echo_gate="+(gateEnabled?"on":"off")+",aec_available="+available+",aec_created="+created+",aec_enabled="+enabled+",gated="+gated+",passed="+passed;
+    }
+    static String echoReportSummary(boolean media,boolean gateEnabled,boolean available,boolean created,boolean enabled,long gated,long passed){
+        return "gate="+(gateEnabled?"on":"off")+",aec"+(available?1:0)+(created?1:0)+(enabled?1:0)+",g"+count(gated)+",p"+count(passed);
+    }
+    private static String count(long value){return value>9999?"9999+":String.valueOf(Math.max(0,value));}
+    static boolean shouldSilence(boolean gateEnabled,boolean wouldGate){return gateEnabled&&wouldGate;}
+    /** (volume-min)/(max-min), or 0 when the stream has no range. Clamped to 0..1. */
+    static float streamVolumeFraction(int volume,int min,int max){
+        if(max<=min)return 0f;
+        float fraction=(volume-min)/(float)(max-min);
+        if(!(fraction>0f))return 0f;
+        return Math.min(fraction,1f);
+    }
+    /** Play thread only. */
+    private float streamVolume(long nowMs){
+        if(streamVolumeAt>=0&&nowMs-streamVolumeAt<STREAM_VOLUME_MS)return cachedStreamVolume;
+        streamVolumeAt=nowMs;
+        try{int stream=voiceStream(media);
+            cachedStreamVolume=streamVolumeFraction(manager.getStreamVolume(stream),manager.getStreamMinVolume(stream),manager.getStreamMaxVolume(stream));
+        }catch(RuntimeException ignored){}
+        return cachedStreamVolume;
+    }
     static float level(byte[] pcm){return level(pcm,0,pcm.length);}
     private static float level(byte[] pcm,int offset,int length){double sum=0;for(int i=offset;i+1<offset+length;i+=2){short sample=(short)((pcm[i]&255)|(pcm[i+1]<<8));sum+=(double)sample*sample;}return length<2?0:(float)Math.min(1,Math.sqrt(sum/(length/2))/10000.0);}
     @Override public void close(){if(!closed.compareAndSet(false,true))return;captureGate.mute(true);
         AudioRecord r=record;if(r!=null)try{r.stop();}catch(Exception ignored){}
         if(capture!=null)capture.interrupt();if(playback!=null)playback.interrupt();
-        synchronized(lock){queue.close();framesWritten=0;framesQueued=0;hadOutput=false;lock.notifyAll();
+        synchronized(lock){echoGate.reset();queue.close();framesWritten=0;framesQueued=0;hadOutput=false;lock.notifyAll();
             if(track!=null){try{track.pause();track.flush();track.release();}catch(Exception ignored){}track=null;}}
         // The capture read is unblocked by stop before release.
         if(capture!=null&&capture!=Thread.currentThread())try{capture.join(250);}catch(InterruptedException ignored){Thread.currentThread().interrupt();}
